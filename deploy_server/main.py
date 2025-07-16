@@ -31,14 +31,18 @@ def deploy_app(req: DeployRequest):
     temp_dir = None
     # git_repo_urlが指定されていればクローン
     if req.git_repo_url:
-        temp_dir = tempfile.mkdtemp(prefix="deploy_repo_")
+        # 環境変数でクローン先ベースディレクトリを指定可能（デフォルト: 絶対パス）
+        import datetime
+        tmp_base = os.getenv("CLONE_BASE_DIR", "/home/cc-company/gradio-fargate-factory/tmp")
+        tmp_base = os.path.abspath(tmp_base)
+        os.makedirs(tmp_base, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        temp_dir = os.path.join(tmp_base, f"{app_name}_{timestamp}")
         try:
             subprocess.check_call([
                 "git", "clone", req.git_repo_url, temp_dir
             ])
         except Exception as e:
-            if temp_dir:
-                shutil.rmtree(temp_dir, ignore_errors=True)
             raise HTTPException(status_code=400, detail=f"Git clone failed: {e}")
         docker_context = temp_dir
 
@@ -76,10 +80,11 @@ def deploy_app(req: DeployRequest):
         try:
             result = subprocess.run(
                 [
-                    "docker", "build", "-t", f"{app_name}:latest", "-f", dockerfile, docker_context
+                    "docker", "build", "-t", f"{app_name}:latest", "-f", dockerfile, "."
                 ],
                 capture_output=True,
-                text=True
+                text=True,
+                cwd=docker_context
             )
             if result.returncode != 0:
                 err_msg = (
@@ -88,13 +93,9 @@ def deploy_app(req: DeployRequest):
                     f"stderr:\n{result.stderr}\n"
                     f"{traceback.format_exc()}"
                 )
-                if temp_dir:
-                    shutil.rmtree(temp_dir, ignore_errors=True)
                 raise HTTPException(status_code=500, detail=err_msg)
         except Exception as e:
             err_msg = f"docker build exception: {e}\n{traceback.format_exc()}"
-            if temp_dir:
-                shutil.rmtree(temp_dir, ignore_errors=True)
             raise HTTPException(status_code=500, detail=err_msg)
         subprocess.check_call([
             "docker", "tag", f"{app_name}:latest", f"{ecr_url}:latest"
@@ -102,9 +103,7 @@ def deploy_app(req: DeployRequest):
         subprocess.check_call([
             "docker", "push", f"{ecr_url}:latest"
         ])
-        # クローンした場合は一時ディレクトリを削除
-        if temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+
 
         # ALBリスナールール追加
         alb_listener_arn = os.environ.get("ALB_LISTENER_ARN")
