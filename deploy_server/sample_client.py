@@ -1,6 +1,6 @@
 import requests
 
-API_URL = "http://localhost:8000/deploy"
+API_URL = "http://localhost:8001/deploy"
 
 payload = {
     "app_name": "myapp",
