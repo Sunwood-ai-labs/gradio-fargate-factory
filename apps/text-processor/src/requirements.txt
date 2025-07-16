@@ -1,5 +1,0 @@
-gradio==4.25.0
-pillow
-numpy
-pandas
-requests
