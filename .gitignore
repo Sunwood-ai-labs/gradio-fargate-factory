@@ -39,3 +39,6 @@ terraform.rc
 
 issue_creator.log
 **/__pycache__/**
+deploy_server/deploy_server.log
+
+tmp/
