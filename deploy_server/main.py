@@ -17,12 +17,30 @@ class DeployRequest(BaseModel):
     docker_context: str = "./"  # Dockerfileのあるディレクトリ
     dockerfile: str = "Dockerfile"  # Dockerfile名（省略可）
     alb_path: str  # 例: "/image-filter/*"
+    git_repo_url: str | None = None  # 追加: クローンするGitリポジトリURL（省略可）
 
 @app.post("/deploy")
 def deploy_app(req: DeployRequest):
+    import tempfile
+    import shutil
+
     app_name = req.app_name
     docker_context = req.docker_context
     dockerfile = req.dockerfile
+
+    temp_dir = None
+    # git_repo_urlが指定されていればクローン
+    if req.git_repo_url:
+        temp_dir = tempfile.mkdtemp(prefix="deploy_repo_")
+        try:
+            subprocess.check_call([
+                "git", "clone", req.git_repo_url, temp_dir
+            ])
+        except Exception as e:
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            raise HTTPException(status_code=400, detail=f"Git clone failed: {e}")
+        docker_context = temp_dir
 
     try:
         # AWS情報取得
@@ -31,8 +49,12 @@ def deploy_app(req: DeployRequest):
         ecr = boto3.client("ecr", region_name=AWS_REGION)
         ecs = boto3.client("ecs", region_name=AWS_REGION)
 
-        # ECRリポジトリURL取得
-        ecr_url = ecr.describe_repositories(repositoryNames=[app_name])["repositories"][0]["repositoryUri"]
+        # ECRリポジトリURL取得（なければ作成）
+        try:
+            ecr_url = ecr.describe_repositories(repositoryNames=[app_name])["repositories"][0]["repositoryUri"]
+        except ecr.exceptions.RepositoryNotFoundException:
+            repo = ecr.create_repository(repositoryName=app_name)
+            ecr_url = repo["repository"]["repositoryUri"]
 
         # Dockerログイン
         login_pw = subprocess.check_output([
@@ -50,15 +72,39 @@ def deploy_app(req: DeployRequest):
             raise Exception("Docker login failed")
 
         # Dockerビルド＆プッシュ
-        subprocess.check_call([
-            "docker", "build", "-t", f"{app_name}:latest", "-f", dockerfile, docker_context
-        ])
+        import traceback
+        try:
+            result = subprocess.run(
+                [
+                    "docker", "build", "-t", f"{app_name}:latest", "-f", dockerfile, docker_context
+                ],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                err_msg = (
+                    f"docker build failed (exit code {result.returncode})\n"
+                    f"stdout:\n{result.stdout}\n"
+                    f"stderr:\n{result.stderr}\n"
+                    f"{traceback.format_exc()}"
+                )
+                if temp_dir:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                raise HTTPException(status_code=500, detail=err_msg)
+        except Exception as e:
+            err_msg = f"docker build exception: {e}\n{traceback.format_exc()}"
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            raise HTTPException(status_code=500, detail=err_msg)
         subprocess.check_call([
             "docker", "tag", f"{app_name}:latest", f"{ecr_url}:latest"
         ])
         subprocess.check_call([
             "docker", "push", f"{ecr_url}:latest"
         ])
+        # クローンした場合は一時ディレクトリを削除
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
         # ALBリスナールール追加
         alb_listener_arn = os.environ.get("ALB_LISTENER_ARN")

@@ -38,3 +38,4 @@ terraform.rc
 .SourceSageAssets/
 
 issue_creator.log
+**/__pycache__/**
