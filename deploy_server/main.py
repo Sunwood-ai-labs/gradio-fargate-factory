@@ -2,11 +2,13 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import subprocess
 import boto3
+from loguru import logger
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
+logger.add("deploy_server.log", rotation="1 MB")
 app = FastAPI()
 
 AWS_REGION = "ap-northeast-1"
@@ -149,20 +151,151 @@ def deploy_app(req: DeployRequest):
                 Actions=[{"Type": "forward", "TargetGroupArn": tg_arn}]
             )
 
-        # ECSサービスforce-new-deployment
-        ecs.update_service(
-            cluster=CLUSTER_NAME,
-            service=app_name,
-            forceNewDeployment=True
-        )
+        # ECSサービス存在確認→なければ作成、あれば更新
+        task_definition = os.environ.get("TASK_DEFINITION", app_name)
+        # サブネットIDは SUBNETS > PUBLIC_SUBNET_IDS > PRIVATE_SUBNET_IDS の順で自動参照
+        subnets_env = os.environ.get("SUBNETS")
+        if not subnets_env:
+            subnets_env = os.environ.get("PUBLIC_SUBNET_IDS") or os.environ.get("PRIVATE_SUBNET_IDS") or ""
+        subnets = [s for s in subnets_env.split(",") if s]
+        security_groups = [s for s in os.environ.get("SECURITY_GROUPS", "").split(",") if s]
 
-        # ECSサービスforce-new-deployment
-        ecs.update_service(
-            cluster=CLUSTER_NAME,
-            service=app_name,
-            forceNewDeployment=True
-        )
+        # CloudWatch Logsのロググループを毎回存在確認＆なければ作成
+        logs = boto3.client("logs", region_name=AWS_REGION)
+        log_group_name = f"/ecs/{app_name}"
+        try:
+            resp = logs.create_log_group(logGroupName=log_group_name)
+            logger.info(f"create_log_group response: {resp}")
+            logger.info(f"Created log group: {log_group_name}")
+        except logs.exceptions.ResourceAlreadyExistsException:
+            logger.info(f"Log group already exists: {log_group_name}")
+        except Exception as e:
+            logger.exception(f"Exception during create_log_group: {e}")
+        # ロググループ存在確認
+        try:
+            groups = logs.describe_log_groups(logGroupNamePrefix=log_group_name).get("logGroups", [])
+            logger.info(f"describe_log_groups result: {groups}")
+            if not any(g["logGroupName"] == log_group_name for g in groups):
+                logger.error(f"Log group {log_group_name} does NOT exist after create attempt!")
+                raise HTTPException(status_code=500, detail=f"Log group {log_group_name} does NOT exist after create attempt!")
+        except Exception as e:
+            logger.exception(f"Exception during describe_log_groups: {e}")
+            raise HTTPException(status_code=500, detail=f"Exception during describe_log_groups: {e}")
 
+        # タスク定義存在確認＆なければ自動登録
+        try:
+            ecs.describe_task_definition(taskDefinition=task_definition)
+            logger.info(f"Task definition '{task_definition}' already exists.")
+        except ecs.exceptions.ClientException:
+            # 必要なロール情報を環境変数から取得
+            execution_role_arn = os.environ.get("ECS_TASK_EXECUTION_ROLE_ARN")
+            task_role_arn = os.environ.get("ECS_TASK_ROLE_ARN")
+            if not execution_role_arn or not task_role_arn:
+                logger.error("ECS_TASK_EXECUTION_ROLE_ARN または ECS_TASK_ROLE_ARN が未設定です")
+                raise HTTPException(status_code=500, detail="ECS_TASK_EXECUTION_ROLE_ARN または ECS_TASK_ROLE_ARN が未設定です")
+            # CloudWatch Logsのロググループを事前に作成（なければ）
+            logs = boto3.client("logs", region_name=AWS_REGION)
+            log_group_name = f"/ecs/{app_name}"
+            try:
+                resp = logs.create_log_group(logGroupName=log_group_name)
+                logger.info(f"create_log_group response: {resp}")
+                logger.info(f"Created log group: {log_group_name}")
+            except logs.exceptions.ResourceAlreadyExistsException:
+                logger.info(f"Log group already exists: {log_group_name}")
+            except Exception as e:
+                logger.exception(f"Exception during create_log_group: {e}")
+            # ロググループ存在確認
+            try:
+                groups = logs.describe_log_groups(logGroupNamePrefix=log_group_name).get("logGroups", [])
+                logger.info(f"describe_log_groups result: {groups}")
+                if not any(g["logGroupName"] == log_group_name for g in groups):
+                    logger.error(f"Log group {log_group_name} does NOT exist after create attempt!")
+                    raise HTTPException(status_code=500, detail=f"Log group {log_group_name} does NOT exist after create attempt!")
+            except Exception as e:
+                logger.exception(f"Exception during describe_log_groups: {e}")
+                raise HTTPException(status_code=500, detail=f"Exception during describe_log_groups: {e}")
+            # タスク定義を自動登録
+            ecs.register_task_definition(
+                family=task_definition,
+                networkMode="awsvpc",
+                requiresCompatibilities=["FARGATE"],
+                cpu="512",
+                memory="1024",
+                executionRoleArn=execution_role_arn,
+                taskRoleArn=task_role_arn,
+                containerDefinitions=[
+                    {
+                        "name": app_name,
+                        "image": f"{ecr_url}:latest",
+                        "portMappings": [
+                            {
+                                "containerPort": 7860,
+                                "protocol": "tcp"
+                            }
+                        ],
+                        "essential": True,
+                        "environment": [],
+                        "logConfiguration": {
+                            "logDriver": "awslogs",
+                            "options": {
+                                "awslogs-group": log_group_name,
+                                "awslogs-region": AWS_REGION,
+                                "awslogs-stream-prefix": "ecs"
+                            }
+                        }
+                    }
+                ]
+            )
+            logger.info(f"Registered new task definition: {task_definition}")
+
+        services = ecs.describe_services(cluster=CLUSTER_NAME, services=[app_name])["services"]
+        service_status = None
+        if services and "status" in services[0]:
+            service_status = services[0]["status"]
+        if not services or service_status != "ACTIVE":
+            if services and service_status and service_status != "ACTIVE":
+                logger.warning(f"Service {app_name} exists but status is {service_status}. Deleting before recreate.")
+                try:
+                    ecs.delete_service(cluster=CLUSTER_NAME, service=app_name, force=True)
+                    logger.info(f"Deleted ECS service: {app_name}")
+                except Exception as del_e:
+                    logger.error(f"Failed to delete service {app_name}: {del_e}")
+            logger.info(f"Creating ECS service: {app_name}")
+            ecs.create_service(
+                cluster=CLUSTER_NAME,
+                serviceName=app_name,
+                taskDefinition=task_definition,
+                loadBalancers=[{
+                    "targetGroupArn": tg_arn,
+                    "containerName": app_name,
+                    "containerPort": 7860
+                }],
+                desiredCount=1,
+                launchType="FARGATE",
+                networkConfiguration={
+                    "awsvpcConfiguration": {
+                        "subnets": subnets,
+                        "securityGroups": security_groups,
+                        "assignPublicIp": "ENABLED"
+                    }
+                }
+            )
+            logger.info(f"ECS service created: {app_name}")
+        else:
+            logger.info(f"Updating ECS service: {app_name}")
+            try:
+                ecs.update_service(
+                    cluster=CLUSTER_NAME,
+                    service=app_name,
+                    forceNewDeployment=True
+                )
+                logger.info(f"ECS service updated: {app_name}")
+            except Exception as update_e:
+                logger.error(f"Failed to update service {app_name}: {update_e}")
+                raise HTTPException(status_code=500, detail=f"Failed to update service: {update_e}")
+
+        logger.info(f"Deployment for {app_name} completed successfully.")
         return {"status": "success", "message": f"{app_name} deployed!"}
     except Exception as e:
+        logger.error(f"Exception during deployment: {e}")
         raise HTTPException(status_code=500, detail=str(e))
