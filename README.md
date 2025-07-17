@@ -2,24 +2,43 @@
 
 ## 🚀 AWS ECS Fargate Gradio動的デプロイシステム
 
-複数のGradioアプリをAWS ECS Fargateにパスベースルーティングで動的にデプロイできるシステムです。
+GitリポジトリからGradioアプリをAWS ECS Fargateに**APIベースで動的にデプロイ**できるシステムです。
 
 ## ✨ 特徴
 
-- **動的アプリ追加**: 新しいGradioアプリを簡単に追加・デプロイ
+- **APIベース動的デプロイ**: FastAPIサーバーによる自動デプロイ
+- **Gitリポジトリ統合**: GitリポジトリURLを指定するだけで自動デプロイ
 - **パスベースルーティング**: 1つのALBで複数アプリを管理
-- **独立デプロイ**: 各アプリは独立してデプロイ・更新可能
-- **自動化**: スクリプトによる完全自動化
-- **スケーラブル**: サーバーレスで自動スケーリング
+- **完全自動化**: Docker build、ECRプッシュ、ECSサービス作成まで自動
+- **スケーラブル**: Fargateによる自動スケーリング
 
 ## 🏗️ システム構成
 
 ```
-ALB (Load Balancer)
-├── /app1/* → Gradio App 1 (ECS Fargate)
-├── /app2/* → Gradio App 2 (ECS Fargate)
-├── /app3/* → Gradio App 3 (ECS Fargate)
-└── /       → 404 (デフォルト)
+┌─────────────────────────────────────────────────────────────┐
+│                    Deploy Server (FastAPI)                  │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │ API: /deploy                                            │  │
+│  │  ├─ Git clone from repository                           │  │
+│  │  ├─ Docker build & push to ECR                         │  │
+│  │  ├─ Create/update ECS service                           │  │
+│  │  └─ Configure ALB routing                               │  │
+│  └─────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      AWS Infrastructure                      │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │ ALB (Load Balancer)                                     │  │
+│  │ ├── /app1/* → Gradio App 1 (ECS Fargate)              │  │
+│  │ ├── /app2/* → Gradio App 2 (ECS Fargate)              │  │
+│  │ ├── /app3/* → Gradio App 3 (ECS Fargate)              │  │
+│  │ └── /       → 404 (デフォルト)                          │  │
+│  └─────────────────────────────────────────────────────────┘  │
+│                                                             │
+│  ECS Cluster | ECR Registry | VPC | IAM Roles             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ## 📋 前提条件
@@ -27,6 +46,7 @@ ALB (Load Balancer)
 - AWS CLI設定済み
 - Terraform >= 1.0インストール済み
 - Docker インストール済み
+- Python 3.9+ インストール済み
 - 適切なAWS権限（ECS、ALB、ECR、VPC、IAM等）
 
 ## 🚀 セットアップ手順
@@ -34,30 +54,32 @@ ALB (Load Balancer)
 ### 1. リポジトリクローン・初期設定
 
 ```bash
-git clone <このリポジトリ>
-cd gradio-ecs-deployment
+git clone https://github.com/Sunwood-ai-labs/gradio-fargate-factory.git
+cd gradio-fargate-factory
 
 # 実行権限付与
 chmod +x scripts/*.sh
 ```
 
-### 2. S3バケット名設定
+### 2. Terraform S3バケット設定
 
-以下のファイルでS3バケット名を変更してください：
+`terraform/base-infrastructure/main.tf`でS3バケット名を変更：
 
-```bash
-# terraform/base-infrastructure/main.tf
-# terraform/modules/gradio-app/main.tf の例
-# scripts/create-new-app.sh
-# scripts/setup-infrastructure.sh
-
-# "your-terraform-state-bucket" を適切な名前に変更
+```hcl
+backend "s3" {
+  bucket = "your-terraform-state-bucket"  # 適切な名前に変更
+  key    = "gradio-ecs/base-infrastructure/terraform.tfstate"
+  region = "ap-northeast-1"
+}
 ```
 
 ### 3. 基盤インフラ構築（一度だけ）
 
 ```bash
-./scripts/setup-infrastructure.sh
+cd terraform/base-infrastructure
+terraform init
+terraform plan
+terraform apply
 ```
 
 これにより以下が作成されます：
@@ -67,50 +89,168 @@ chmod +x scripts/*.sh
 - IAMロール
 - セキュリティグループ
 
+### 4. Deploy Server設定
+
+基盤インフラ構築後、Terraformのoutputを使って`.env`ファイルを設定：
+
+```bash
+cd ../..
+cd deploy_server
+
+# Terraformのoutputから.envファイルを設定
+cp .env.example .env
+```
+
+`.env`ファイルに以下の値を設定：
+
+```bash
+# Terraformのoutputから取得
+cd ../terraform/base-infrastructure
+terraform output
+
+# 以下を.envファイルに設定
+ALB_ARN=<terraform output alb_arn>
+ALB_DNS_NAME=<terraform output alb_dns_name>
+ALB_LISTENER_ARN=<terraform output alb_listener_arn>
+ALB_SECURITY_GROUP_ID=<terraform output alb_security_group_id>
+ALB_ZONE_ID=<terraform output alb_zone_id>
+ECS_CLUSTER_ID=<terraform output ecs_cluster_id>
+ECS_CLUSTER_NAME=<terraform output ecs_cluster_name>
+ECS_SECURITY_GROUP_ID=<terraform output ecs_security_group_id>
+ECS_TASK_EXECUTION_ROLE_ARN=<terraform output ecs_task_execution_role_arn>
+ECS_TASK_ROLE_ARN=<terraform output ecs_task_role_arn>
+PRIVATE_SUBNET_IDS=<terraform output private_subnet_ids>
+PUBLIC_SUBNET_IDS=<terraform output public_subnet_ids>
+VPC_ID=<terraform output vpc_id>
+```
+
+### 5. Deploy Server起動
+
+```bash
+cd deploy_server
+
+# 依存関係インストール
+pip install -r pyproject.toml
+
+# サーバー起動
+python main.py
+```
+
+Deploy Serverが `http://localhost:8000` で起動します。
+
 ## 📱 アプリ運用
 
-### 新しいアプリ作成
+### Deploy Server APIでのデプロイ
 
-```bash
-# 基本的な作成
-./scripts/create-new-app.sh my-chatbot
+Deploy Serverが起動したら、APIを使ってGradioアプリをデプロイできます。
 
-# カスタムパスとポート指定
-./scripts/create-new-app.sh image-classifier /classifier/* 8080
+#### 1. APIエンドポイント
+
+```
+POST http://localhost:8000/deploy
 ```
 
-### アプリ開発
+#### 2. リクエストパラメータ
 
-```bash
-cd apps/my-chatbot/src
-
-# app.pyを編集してGradioアプリを実装
-nano app.py
-
-# 必要に応じてrequirements.txtも更新
-nano requirements.txt
+```json
+{
+  "app_name": "myapp",              // アプリ名（必須）
+  "alb_path": "/myapp/*",           // ALBパスパターン（必須）
+  "git_repo_url": "https://github.com/user/repo.git",  // GitリポジトリURL（オプション）
+  "docker_context": "./",           // Dockerfileがあるディレクトリ（デフォルト: ./）
+  "dockerfile": "Dockerfile",       // Dockerファイル名（デフォルト: Dockerfile）
+  "cpu": "2048",                    // CPU（デフォルト: 2048）
+  "memory": "4096",                 // メモリ（デフォルト: 4096）
+  "force_recreate": false           // 強制再作成フラグ（デフォルト: false）
+}
 ```
 
-### アプリデプロイ
+#### 3. デプロイクライアント使用例
+
+`deploy_client.py`を使った便利なデプロイ：
 
 ```bash
-cd apps/my-chatbot
-./deploy.sh
+cd deploy_server
+
+# 基本的なデプロイ
+python deploy_client.py \
+  --app myapp \
+  --path "/myapp/*" \
+  --git "https://github.com/user/gradio-app.git"
+
+# リソースを指定してデプロイ
+python deploy_client.py \
+  --app image-classifier \
+  --path "/classifier/*" \
+  --git "https://github.com/user/image-classifier.git" \
+  --cpu 4096 \
+  --mem 8192
+
+# 強制再作成
+python deploy_client.py \
+  --app myapp \
+  --path "/myapp/*" \
+  --git "https://github.com/user/gradio-app.git" \
+  --force
 ```
 
-デプロイ処理：
-1. Terraformでインフラ作成（ECR、ECSサービス、ALBルーティング）
-2. Dockerイメージビルド
-3. ECRにプッシュ
-4. ECSサービス更新
+#### 4. 自動デプロイ処理
+
+APIコールすると以下が自動実行されます：
+
+1. **Gitクローン**: 指定リポジトリを一時ディレクトリにクローン
+2. **Dockerビルド**: Dockerfile（またはデフォルトDockerfile）でイメージビルド
+3. **ECRプッシュ**: ビルドしたイメージをECRにプッシュ
+4. **ECSサービス作成/更新**: Fargateサービスを作成または更新
+5. **ALBルーティング設定**: 指定パスパターンでルーティング設定
+6. **ヘルスチェック設定**: Gradioアプリのヘルスチェック設定
 
 ### アプリ更新
 
-アプリコードを変更した後：
+同じAPIコールで更新が可能：
 
 ```bash
-cd apps/my-chatbot
-./deploy.sh  # 同じコマンドで更新
+# 同じコマンドで更新
+python deploy_client.py \
+  --app myapp \
+  --path "/myapp/*" \
+  --git "https://github.com/user/gradio-app.git"
+```
+
+### 実際の使用例
+
+`sample_client.py`での実際のデプロイ例：
+
+```python
+import requests
+import json
+
+API_URL = "http://localhost:8000/deploy"
+
+payload = {
+    "app_name": "myapp",
+    "alb_path": "/myapp/*",
+    "git_repo_url": "http://192.168.0.131:3000/Sunwood-ai-labs/gradio-ff-demo-001.git",
+    "cpu": "4096",
+    "memory": "8192"
+}
+
+response = requests.post(API_URL, json=payload)
+print(response.json())
+```
+
+レスポンス例：
+```json
+{
+  "status": "success",
+  "message": "myapp deployed successfully!",
+  "deployed_url": "http://gradio-ecs-alb-xxx.ap-northeast-1.elb.amazonaws.com/myapp",
+  "app_name": "myapp",
+  "cpu": "4096",
+  "memory": "8192",
+  "deployment_type": "create",
+  "estimated_ready_time": "5-10 minutes"
+}
 ```
 
 ## 🔧 運用コマンド
