@@ -42,3 +42,9 @@ issue_creator.log
 deploy_server/deploy_server.log
 
 tmp/
+deploy_server/.env
+terraform/base-infrastructure/.terraform.lock.hcl
+check.sh
+check2.sh
+
+.env
