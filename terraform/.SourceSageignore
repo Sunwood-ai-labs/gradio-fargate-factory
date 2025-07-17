@@ -52,5 +52,3 @@ repository_summary.md
 venv
 .venv
 
-uv.lock
-tmp/
