@@ -1,0 +1,18 @@
+[project]
+name = "deploy_server"
+version = "0.1.0"
+description = "FastAPI deployment server for ECS/ECR/ALB automation"
+authors = ["Your Name <your.email@example.com>"]
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi",
+    "pydantic",
+    "boto3",
+    "python-dotenv",
+    "uvicorn",
+    "requests>=2.32.4",
+    "loguru>=0.7.3",
+]
+
+[tool.uv]
+# uv用の追加設定があればここに記載

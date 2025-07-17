@@ -35,3 +35,19 @@ override.tf.json
 # Ignore CLI configuration files
 .terraformrc
 terraform.rc
+.SourceSageAssets/
+
+issue_creator.log
+**/__pycache__/**
+deploy_server/deploy_server.log
+
+tmp/
+deploy_server/.env
+terraform/base-infrastructure/.terraform.lock.hcl
+check.sh
+check2.sh
+
+.env
+
+
+.env
