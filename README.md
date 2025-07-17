@@ -1,4 +1,16 @@
-# Gradio Fargate Factory
+<p align="center">
+  <img src="header.png" alt="Gradio Fargate Factory" width="600"/>
+</p>
+
+<h1 align="center">Gradio Fargate Factory</h1>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.9+-blue?logo=python">
+  <img src="https://img.shields.io/badge/FastAPI-API-green?logo=fastapi">
+  <img src="https://img.shields.io/badge/AWS-ECS%20Fargate-orange?logo=amazon-aws">
+  <img src="https://img.shields.io/badge/Terraform-IaC-purple?logo=terraform">
+  <img src="https://img.shields.io/badge/Docker-Container-blue?logo=docker">
+</p>
 
 ## 🚀 AWS ECS Fargate Gradio動的デプロイシステム
 
@@ -360,22 +372,11 @@ interface.launch(server_name="0.0.0.0", server_port=7860)
 アプリのCPU・メモリを変更：
 
 ```hcl
-# apps/my-app/terraform/main.tf
-module "gradio_app" {
-  source = "../../terraform/modules/gradio-app"
-  
-  # ...他の設定...
-  
-  cpu           = 512   # デフォルト: 256
-  memory        = 1024  # デフォルト: 512
-  desired_count = 2     # デフォルト: 1
-}
 ```
 
 ### 環境変数追加
 
 ```hcl
-# terraform/modules/gradio-app/main.tf のcontainer_definitionsで
 environment = [
   {
     name  = "PORT"
