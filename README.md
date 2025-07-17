@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="header2.png" alt="Gradio Fargate Factory" width="600"/>
+  <img src="header2.png" alt="Gradio Fargate Factory" width="100%"/>
 </p>
 
 <h1 align="center">Gradio Fargate Factory</h1>
