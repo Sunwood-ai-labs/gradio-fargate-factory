@@ -27,14 +27,5 @@ provider "aws" {
     }
   }
 }
-module "myapp" {
-  source        = "../modules/gradio-app"
-  app_name      = "myapp"
-  app_path      = "/myapp/*"
-  app_port      = 7860
-  project_name  = "gradio-fargate-factory"
-  # 必要に応じてVPCやALB等のIDも渡す
-  # vpc_id     = module.vpc.vpc_id
-  # alb_arn    = module.alb.alb_arn
-  # など
-}
+# 個別アプリケーションはdeploy_serverで動的に作成されるため、
+# 基盤インフラ（VPC、ALB、ECS Cluster、IAMロール）のみ構築
