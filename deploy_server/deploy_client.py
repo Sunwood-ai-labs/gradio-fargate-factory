@@ -8,7 +8,7 @@ uv run python deploy_client.py --app app2 --path "/app2*" \
 
 import argparse, json, requests, sys
 
-API_URL = "http://localhost:8001/deploy"
+API_URL = "http://localhost:8002/deploy"
 
 def main():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
