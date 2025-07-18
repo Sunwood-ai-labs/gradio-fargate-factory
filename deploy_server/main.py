@@ -1,29 +1,45 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import os
 import subprocess
 import boto3
+from fastapi import FastAPI, HTTPException
 from loguru import logger
-import os
-from dotenv import load_dotenv
 
-load_dotenv()
+from models.deploy import DeployRequest
+from utils.common import (
+    load_terraform_outputs,
+    get_config_value,
+    ensure_security_group_rules,
+    AWS_REGION,
+    CLUSTER_NAME,
+    TERRAFORM_STATE_PATH,
+)
 
 logger.add("deploy_server.log", rotation="1 MB")
 app = FastAPI()
 
-AWS_REGION = "ap-northeast-1"
-CLUSTER_NAME = "gradio-ecs-cluster"
-
-class DeployRequest(BaseModel):
-    app_name: str
-    docker_context: str = "./"  # Dockerfileのあるディレクトリ
-    dockerfile: str = "Dockerfile"  # Dockerfile名（省略可）
-    alb_path: str  # 例: "/image-filter/*"
-    git_repo_url: str | None = None  # 追加: クローンするGitリポジトリURL（省略可）
-    # 新しいパラメータ追加
-    cpu: str = "2048"  # デフォルトを大幅に増加
-    memory: str = "4096"  # デフォルトを大幅に増加
-    force_recreate: bool = False  # 強制再作成フラグ
+@app.get("/config")
+def get_current_config():
+    """現在の設定情報を確認するためのエンドポイント"""
+    try:
+        tf_outputs = load_terraform_outputs()
+        config = {
+            "aws_region": AWS_REGION,
+            "cluster_name": CLUSTER_NAME,
+            "terraform_state_path": TERRAFORM_STATE_PATH,
+            "terraform_outputs_available": list(tf_outputs.keys()),
+            "resolved_config": {
+                "alb_arn": get_config_value("ALB_ARN", "alb_arn", "not_configured"),
+                "alb_dns_name": get_config_value("ALB_DNS_NAME", "alb_dns_name", "not_configured"),
+                "alb_listener_arn": get_config_value("ALB_LISTENER_ARN", "alb_listener_arn", "not_configured"),
+                "vpc_id": get_config_value("VPC_ID", "vpc_id", "not_configured"),
+                "ecs_cluster_name": get_config_value("ECS_CLUSTER_NAME", "ecs_cluster_name", CLUSTER_NAME),
+                "ecs_task_execution_role_arn": get_config_value("ECS_TASK_EXECUTION_ROLE_ARN", "ecs_task_execution_role_arn", "not_configured"),
+                "ecs_task_role_arn": get_config_value("ECS_TASK_ROLE_ARN", "ecs_task_role_arn", "not_configured"),
+            }
+        }
+        return config
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.post("/deploy")
 def deploy_app(req: DeployRequest):
@@ -36,6 +52,9 @@ def deploy_app(req: DeployRequest):
 
     temp_dir = None
     deployed_url = None
+    
+    # セキュリティグループルールの確認・追加
+    ensure_security_group_rules()
     
     # git_repo_urlが指定されていればクローン
     if req.git_repo_url:
@@ -106,6 +125,7 @@ def deploy_app(req: DeployRequest):
         except Exception as e:
             err_msg = f"docker build exception: {e}\n{traceback.format_exc()}"
             raise HTTPException(status_code=500, detail=err_msg)
+        
         subprocess.check_call([
             "docker", "tag", f"{app_name}:latest", f"{ecr_url}:latest"
         ])
@@ -113,44 +133,35 @@ def deploy_app(req: DeployRequest):
             "docker", "push", f"{ecr_url}:latest"
         ])
 
-        # ALBリスナールール追加
-        alb_listener_arn = os.environ.get("ALB_LISTENER_ARN")
-        if not alb_listener_arn:
-            raise Exception("ALB_LISTENER_ARN環境変数が未設定です")
+        # ALB設定 - Terraform outputsと環境変数から取得
+        alb_listener_arn = get_config_value("ALB_LISTENER_ARN", "alb_listener_arn")
+        alb_dns_name = get_config_value("ALB_DNS_NAME", "alb_dns_name")
+        alb_vpc_id = get_config_value("VPC_ID", "vpc_id")
+        
         alb_path = req.alb_path
-
-        # ALBのVPC情報を取得
-        listener_info = elbv2.describe_listeners(ListenerArns=[alb_listener_arn])
-        lb_arn = listener_info["Listeners"][0]["LoadBalancerArn"]
         
-        # ロードバランサーの詳細情報を取得
-        lb_info = elbv2.describe_load_balancers(LoadBalancerArns=[lb_arn])
-        alb_vpc_id = lb_info["LoadBalancers"][0]["VpcId"]
-        alb_dns_name = lb_info["LoadBalancers"][0]["DNSName"]
-        
-        # プロトコルを決定
+        # プロトコル決定
         protocol = "http"
         try:
-            listeners = elbv2.describe_listeners(LoadBalancerArn=lb_arn)["Listeners"]
-            has_https = any(listener["Port"] == 443 for listener in listeners)
-            if has_https:
-                protocol = "https"
+            alb_arn = get_config_value("ALB_ARN", "alb_arn")
+            if alb_arn:
+                listeners = elbv2.describe_listeners(LoadBalancerArn=alb_arn)["Listeners"]
+                has_https = any(listener["Port"] == 443 for listener in listeners)
+                if has_https:
+                    protocol = "https"
         except Exception:
             protocol = "http"
         
-        # ### <<< 修正 >>> ###
-        # デプロイURLとGradioのルートパス、ヘルスチェックパスをここで一元的に定義
-        base_path = alb_path.rstrip("/*").rstrip("/")  # "/myapp/*" -> "/myapp"
+        # URL設定
+        base_path = alb_path.rstrip("/*").rstrip("/")
         deployed_url = f"{protocol}://{alb_dns_name}{base_path}"
-        gradio_root_path = base_path # Gradioアプリに渡すルートパス
-        health_check_path = "/" # Gradioのヘルスチェック用パス
-        # health_check_path = "/health-check"
+        gradio_root_path = base_path
+        health_check_path = "/"
         
         logger.info(f"ALB DNS Name: {alb_dns_name}")
         logger.info(f"Target URL: {deployed_url}")
-        logger.info(f"Gradio Root Path will be set to: {gradio_root_path}")
-        logger.info(f"Target Group Health Check Path will be set to: {health_check_path}")
-
+        logger.info(f"Gradio Root Path: {gradio_root_path}")
+        logger.info(f"Health Check Path: {health_check_path}")
 
         # ターゲットグループの確認・作成・更新
         tg_name = f"{app_name}-tg"
@@ -160,37 +171,34 @@ def deploy_app(req: DeployRequest):
             existing_tgs = elbv2.describe_target_groups(Names=[tg_name])["TargetGroups"]
             tg_arn = existing_tgs[0]["TargetGroupArn"]
             logger.info(f"Using existing target group: {tg_name}")
-            # ### <<< 追加 >>> ###
-            # 既存ターゲットグループのヘルスチェック設定を更新
+            
+            # ヘルスチェック設定を最適化
             elbv2.modify_target_group(
                 TargetGroupArn=tg_arn,
                 HealthCheckPath=health_check_path,
-                HealthCheckIntervalSeconds=30, # 間隔を短くして早期復旧
-                HealthCheckTimeoutSeconds=15, # タイムアウトも調整
+                HealthCheckIntervalSeconds=30,
+                HealthCheckTimeoutSeconds=5,
                 HealthyThresholdCount=2,
-                UnhealthyThresholdCount=3, # 失敗回数を減らして早く切り離す
-                Matcher={'HttpCode': '200'} # Gradioの/health-checkは200を返す
+                UnhealthyThresholdCount=3,
+                Matcher={'HttpCode': '200'}
             )
-            logger.info(f"Updated health check path for target group '{tg_name}' to '{health_check_path}'")
+            logger.info(f"Updated health check settings for target group '{tg_name}'")
 
         except elbv2.exceptions.TargetGroupNotFoundException:
-            # ターゲットグループを新規作成
             logger.info(f"Creating new target group: {tg_name}")
-            # ### <<< 修正 >>> ###
-            # ヘルスチェックパスを正しく設定
             tg = elbv2.create_target_group(
                 Name=tg_name,
                 Protocol="HTTP",
                 Port=7860,
                 VpcId=alb_vpc_id,
                 TargetType="ip",
-                HealthCheckPath=health_check_path, # 正しいパスを設定
+                HealthCheckPath=health_check_path,
                 HealthCheckProtocol="HTTP",
                 HealthCheckIntervalSeconds=30,
-                HealthCheckTimeoutSeconds=15,
+                HealthCheckTimeoutSeconds=5,
                 HealthyThresholdCount=2,
                 UnhealthyThresholdCount=3,
-                Matcher={'HttpCode': '200'} # 200のみを正常とみなす
+                Matcher={'HttpCode': '200'}
             )
             tg_arn = tg["TargetGroups"][0]["TargetGroupArn"]
             logger.info(f"Created target group: {tg_name}")
@@ -202,8 +210,7 @@ def deploy_app(req: DeployRequest):
             for cond in rule.get("Conditions", []):
                 if cond.get("Field") == "path-pattern" and alb_path in cond.get("Values", []):
                     rule_exists = True
-                    # ### <<< 追加 >>> ###
-                    # ルールが既にあれば、転送先TGが正しいか確認・修正する
+                    # ルールの転送先TGが正しいか確認・修正
                     is_correct_tg = False
                     for action in rule.get("Actions", []):
                         if action.get("TargetGroupArn") == tg_arn:
@@ -231,13 +238,10 @@ def deploy_app(req: DeployRequest):
             )
             logger.info(f"Created ALB rule with priority {next_priority}")
 
-        # ECSタスク定義の設定
-        task_definition_family = app_name # タスク定義ファミリーはアプリ名と一致させる
-        execution_role_arn = os.environ.get("ECS_TASK_EXECUTION_ROLE_ARN")
-        task_role_arn = os.environ.get("ECS_TASK_ROLE_ARN")
-        
-        if not execution_role_arn or not task_role_arn:
-            raise HTTPException(status_code=500, detail="ECS role ARNs not configured")
+        # ECSタスク定義の設定 - Terraform outputsから取得
+        task_definition_family = app_name
+        execution_role_arn = get_config_value("ECS_TASK_EXECUTION_ROLE_ARN", "ecs_task_execution_role_arn")
+        task_role_arn = get_config_value("ECS_TASK_ROLE_ARN", "ecs_task_role_arn")
 
         # CloudWatch Logsの確認
         log_group_name = f"/ecs/{app_name}"
@@ -248,49 +252,40 @@ def deploy_app(req: DeployRequest):
             logger.info(f"Log group already exists: {log_group_name}")
 
         # 新しいタスク定義を登録
-        logger.info(f"Registering task definition with CPU: {req.cpu}, Memory: {req.memory}")
-        ecs.register_task_definition(
-            family=task_definition_family,
-            networkMode="awsvpc",
-            requiresCompatibilities=["FARGATE"],
-            cpu=req.cpu,
-            memory=req.memory,
-            executionRoleArn=execution_role_arn,
-            taskRoleArn=task_role_arn,
-            containerDefinitions=[
-                {
-                    "name": app_name,
-                    "image": f"{ecr_url}:latest",
-                    "portMappings": [
-                        {
-                            "containerPort": 7860,
-                            "protocol": "tcp"
-                        }
-                    ],
-                    "essential": True,
-                    # ### <<< 修正 >>> ###
-                    # 環境変数にGRADIO_ROOT_PATHを追加
-                    "environment": [
-                        {"name": "GRADIO_SERVER_NAME", "value": "0.0.0.0"},
-                        {"name": "GRADIO_SERVER_PORT", "value": "7860"},
-                        {"name": "GRADIO_ROOT_PATH", "value": gradio_root_path}
-                    ],
-                    "logConfiguration": {
-                        "logDriver": "awslogs",
-                        "options": {
-                            "awslogs-group": log_group_name,
-                            "awslogs-region": AWS_REGION,
-                            "awslogs-stream-prefix": "ecs"
-                        }
-                    }
-                }
-            ]
+        from utils.aws import register_task_definition, update_ecs_service, delete_ecs_service, create_ecs_service
+        register_task_definition(
+            ecs, app_name, req, ecr_url, gradio_root_path, log_group_name, execution_role_arn, task_role_arn
         )
 
-        # サブネット設定
-        subnets_env = os.environ.get("SUBNETS") or os.environ.get("PUBLIC_SUBNET_IDS") or os.environ.get("PRIVATE_SUBNET_IDS") or ""
-        subnets = [s.strip() for s in subnets_env.split(",") if s.strip()]
-        security_groups = [s.strip() for s in os.environ.get("SECURITY_GROUPS", "").split(",") if s.strip()]
+        # サブネット・セキュリティグループ設定 - Terraform outputsと環境変数から取得
+        # SUBNETSが設定されていればそれを使用、なければpublic_subnet_idsから取得
+        subnets_str = get_config_value("SUBNETS", "private_subnet_ids", None)
+        if not subnets_str:
+            # Terraform outputからpublic_subnet_idsを取得
+            tf_outputs = load_terraform_outputs()
+            public_subnets = tf_outputs.get("public_subnet_ids", [])
+            if isinstance(public_subnets, list):
+                subnets_str = ",".join(public_subnets)
+            else:
+                subnets_str = str(public_subnets)
+        
+        if isinstance(subnets_str, list):
+            subnets = [s.strip() for s in subnets_str if s.strip()]
+        else:
+            subnets = [s.strip() for s in str(subnets_str).split(",") if s.strip()]
+        
+        # セキュリティグループも同様に取得
+        security_groups_str = get_config_value("SECURITY_GROUPS", "ecs_security_group_id", None)
+        if not security_groups_str:
+            # ECSタスク用のセキュリティグループIDを取得
+            ecs_sg_id = get_config_value("ECS_SECURITY_GROUP_ID", "ecs_security_group_id", None)
+            if ecs_sg_id:
+                security_groups_str = ecs_sg_id
+        
+        if isinstance(security_groups_str, list):
+            security_groups = [s.strip() for s in security_groups_str if s.strip()]
+        else:
+            security_groups = [s.strip() for s in str(security_groups_str).split(",") if s.strip()]
 
         # ECSサービスの処理
         services = ecs.describe_services(cluster=CLUSTER_NAME, services=[app_name])["services"]
@@ -298,30 +293,13 @@ def deploy_app(req: DeployRequest):
         if services and services[0]["status"] == "ACTIVE" and not req.force_recreate:
             # 既存サービスを更新
             logger.info(f"Updating existing ECS service: {app_name}")
-            try:
-                ecs.update_service(
-                    cluster=CLUSTER_NAME,
-                    service=app_name,
-                    taskDefinition=task_definition_family, # ### <<< 修正 >>> ### family名を渡す
-                    enableExecuteCommand=True, 
-                    forceNewDeployment=True
-                )
-                logger.info(f"Successfully updated service: {app_name}")
-                deployment_type = "update"
-                
-            except Exception as update_e:
-                logger.error(f"Failed to update service: {update_e}")
-                raise HTTPException(status_code=500, detail=f"Service update failed: {update_e}")
+            deployment_type = update_ecs_service(ecs, app_name, task_definition_family)
                 
         else:
             # 新しいサービスを作成
             if services and req.force_recreate:
-                logger.info(f"Force recreate requested - deleting existing service")
-                try:
-                    ecs.delete_service(cluster=CLUSTER_NAME, service=app_name, force=True)
-                    logger.info(f"Deleted existing service for recreation")
-                    
-                    # 削除完了を待機
+                deleted = delete_ecs_service(ecs, app_name)
+                if deleted:
                     import time
                     for i in range(30):
                         time.sleep(10)
@@ -332,38 +310,10 @@ def deploy_app(req: DeployRequest):
                                 break
                         except:
                             break
-                except Exception as del_e:
-                    logger.warning(f"Failed to delete service: {del_e}")
             
-            logger.info(f"Creating new ECS service: {app_name}")
-            try:
-                ecs.create_service(
-                    cluster=CLUSTER_NAME,
-                    serviceName=app_name,
-                    taskDefinition=task_definition_family, # ### <<< 修正 >>> ### family名を渡す
-                    enableExecuteCommand=True,
-                    loadBalancers=[{
-                        "targetGroupArn": tg_arn,
-                        "containerName": app_name,
-                        "containerPort": 7860
-                    }],
-                    desiredCount=1,
-                    launchType="FARGATE",
-                    networkConfiguration={
-                        "awsvpcConfiguration": {
-                            "subnets": subnets,
-                            "securityGroups": security_groups,
-                            "assignPublicIp": "ENABLED" # 開発・検証用途としてENABLEDのまま
-                        }
-                    },
-                    healthCheckGracePeriodSeconds=300 # ヘルスチェックの猶予期間
-                )
-                logger.info(f"Successfully created service: {app_name}")
-                deployment_type = "create"
-                
-            except Exception as create_e:
-                logger.error(f"Failed to create service: {create_e}")
-                raise HTTPException(status_code=500, detail=f"Service creation failed: {create_e}")
+            deployment_type = create_ecs_service(
+                ecs, app_name, task_definition_family, tg_arn, subnets, security_groups
+            )
 
         # 成功ログとレスポンス
         logger.info(f"🚀 Deployment completed: {deployed_url}")
@@ -400,4 +350,4 @@ def deploy_app(req: DeployRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8002)
