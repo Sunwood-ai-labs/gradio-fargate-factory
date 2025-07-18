@@ -45,3 +45,12 @@ output "ecs_task_execution_role_arn" {
 output "ecs_task_role_arn" {
   value = module.iam.ecs_task_role_arn
 }
+
+output "ecs_security_group_id" {
+  description = "ECSタスク用セキュリティグループID"
+  value       = module.alb.ecs_tasks_security_group_id
+}
+output "security_groups" {
+  description = "SECURITY_GROUPS互換"
+  value       = module.alb.ecs_tasks_security_group_id
+}

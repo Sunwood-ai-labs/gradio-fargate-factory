@@ -49,8 +49,12 @@ output "alb_security_group_id" {
 }
 
 output "ecs_security_group_id" {
-  description = "ECSタスクセキュリティグループID"
-  value       = aws_security_group.ecs_tasks.id
+  description = "ECSタスク用セキュリティグループID"
+  value       = module.alb.ecs_tasks_security_group_id
+}
+output "ecs_security_group_id" {
+  description = "ECSタスク用セキュリティグループID"
+  value       = module.alb.ecs_tasks_security_group_id
 }
 
 output "ecs_task_execution_role_arn" {

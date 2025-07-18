@@ -4,16 +4,22 @@ import subprocess
 import boto3
 from loguru import logger
 import os
+import json
 from dotenv import load_dotenv
 from botocore.exceptions import ClientError
+from pathlib import Path
 
 load_dotenv()
 
 logger.add("deploy_server.log", rotation="1 MB")
 app = FastAPI()
 
-AWS_REGION = "ap-northeast-1"
+# AWS Region - 環境変数から取得、デフォルトは ap-northeast-1
+AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-1")
 CLUSTER_NAME = os.getenv("ECS_CLUSTER_NAME", "gradio-ecs-cluster")
+
+# Terraform状態ファイルのパス（環境変数で指定可能）
+TERRAFORM_STATE_PATH = os.getenv("TERRAFORM_STATE_PATH", "terraform/base-infrastructure/terraform.tfstate")
 
 class DeployRequest(BaseModel):
     app_name: str
@@ -25,13 +31,75 @@ class DeployRequest(BaseModel):
     memory: str = "4096"
     force_recreate: bool = False
 
+def load_terraform_outputs():
+    """Terraform状態ファイルからoutputを読み込み"""
+    try:
+        # 絶対パスと相対パスの両方に対応
+        if os.path.isabs(TERRAFORM_STATE_PATH):
+            state_file_path = Path(TERRAFORM_STATE_PATH)
+        else:
+            # 相対パスの場合、プロジェクトルートからの相対パス
+            project_root = Path(__file__).parent.parent  # deploy_server/../
+            state_file_path = project_root / TERRAFORM_STATE_PATH
+        
+        if not state_file_path.exists():
+            logger.warning(f"Terraform state file not found at {state_file_path}")
+            return {}
+        
+        with open(state_file_path, 'r') as f:
+            state_data = json.load(f)
+        
+        outputs = {}
+        if 'outputs' in state_data:
+            for key, output in state_data['outputs'].items():
+                outputs[key] = output['value']
+        
+        logger.info(f"Loaded Terraform outputs from {state_file_path}")
+        logger.debug(f"Available outputs: {list(outputs.keys())}")
+        return outputs
+        
+    except Exception as e:
+        logger.error(f"Error loading Terraform outputs: {e}")
+        return {}
+
+def get_config_value(env_key: str, tf_output_key: str = None, default: str = None):
+    """環境変数 > Terraform output > デフォルト値 の優先順位で設定値を取得"""
+    # 環境変数が設定されていればそれを使用
+    env_value = os.getenv(env_key)
+    if env_value:
+        return env_value
+    
+    # Terraform outputから取得を試行
+    if tf_output_key:
+        tf_outputs = load_terraform_outputs()
+        tf_value = tf_outputs.get(tf_output_key)
+        if tf_value:
+            return tf_value
+    
+    # デフォルト値を返す
+    if default is not None:
+        return default
+    
+    # どこからも取得できない場合は例外
+    raise ValueError(f"Configuration value not found: env_key={env_key}, tf_output_key={tf_output_key}")
+
 def ensure_security_group_rules():
     """ECSセキュリティグループに必要なルールを追加"""
     try:
         ec2 = boto3.client("ec2", region_name=AWS_REGION)
         
-        ecs_sg_id = os.getenv("ECS_SECURITY_GROUP_ID")
-        alb_sg_id = os.getenv("ALB_SECURITY_GROUP_ID")
+        # セキュリティグループIDを取得
+        ecs_sg_id = get_config_value("ECS_SECURITY_GROUP_ID", "ecs_security_group_id", None)
+        alb_sg_id = get_config_value("ALB_SECURITY_GROUP_ID", "alb_security_group_id", None)
+        
+        if not ecs_sg_id:
+            logger.warning("ECS Security Group ID not found - checking Terraform outputs for ecs_tasks security group")
+            # Terraform stateから直接ECSタスク用セキュリティグループを探す
+            tf_outputs = load_terraform_outputs()
+            # aws_security_group.ecs_tasksのIDを探す
+            if 'resources' in load_terraform_outputs():
+                # この場合は別の方法でSGを見つける必要がある
+                pass
         
         if not ecs_sg_id or not alb_sg_id:
             logger.warning("Security Group IDs not configured - skipping rule setup")
@@ -90,6 +158,30 @@ def ensure_security_group_rules():
     except Exception as e:
         logger.error(f"Error setting up security group rules: {e}")
         # セキュリティグループの設定は失敗してもデプロイを続行
+
+@app.get("/config")
+def get_current_config():
+    """現在の設定情報を確認するためのエンドポイント"""
+    try:
+        tf_outputs = load_terraform_outputs()
+        config = {
+            "aws_region": AWS_REGION,
+            "cluster_name": CLUSTER_NAME,
+            "terraform_state_path": TERRAFORM_STATE_PATH,
+            "terraform_outputs_available": list(tf_outputs.keys()),
+            "resolved_config": {
+                "alb_arn": get_config_value("ALB_ARN", "alb_arn", "not_configured"),
+                "alb_dns_name": get_config_value("ALB_DNS_NAME", "alb_dns_name", "not_configured"),
+                "alb_listener_arn": get_config_value("ALB_LISTENER_ARN", "alb_listener_arn", "not_configured"),
+                "vpc_id": get_config_value("VPC_ID", "vpc_id", "not_configured"),
+                "ecs_cluster_name": get_config_value("ECS_CLUSTER_NAME", "ecs_cluster_name", CLUSTER_NAME),
+                "ecs_task_execution_role_arn": get_config_value("ECS_TASK_EXECUTION_ROLE_ARN", "ecs_task_execution_role_arn", "not_configured"),
+                "ecs_task_role_arn": get_config_value("ECS_TASK_ROLE_ARN", "ecs_task_role_arn", "not_configured"),
+            }
+        }
+        return config
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.post("/deploy")
 def deploy_app(req: DeployRequest):
@@ -183,20 +275,17 @@ def deploy_app(req: DeployRequest):
             "docker", "push", f"{ecr_url}:latest"
         ])
 
-        # ALB設定
-        alb_listener_arn = os.getenv("ALB_LISTENER_ARN")
-        alb_dns_name = os.getenv("ALB_DNS_NAME")
-        alb_vpc_id = os.getenv("VPC_ID")
-        
-        if not alb_listener_arn or not alb_dns_name or not alb_vpc_id:
-            raise Exception("ALB environment variables not configured")
+        # ALB設定 - Terraform outputsと環境変数から取得
+        alb_listener_arn = get_config_value("ALB_LISTENER_ARN", "alb_listener_arn")
+        alb_dns_name = get_config_value("ALB_DNS_NAME", "alb_dns_name")
+        alb_vpc_id = get_config_value("VPC_ID", "vpc_id")
         
         alb_path = req.alb_path
         
         # プロトコル決定
         protocol = "http"
         try:
-            alb_arn = os.getenv("ALB_ARN")
+            alb_arn = get_config_value("ALB_ARN", "alb_arn")
             if alb_arn:
                 listeners = elbv2.describe_listeners(LoadBalancerArn=alb_arn)["Listeners"]
                 has_https = any(listener["Port"] == 443 for listener in listeners)
@@ -230,7 +319,7 @@ def deploy_app(req: DeployRequest):
                 TargetGroupArn=tg_arn,
                 HealthCheckPath=health_check_path,
                 HealthCheckIntervalSeconds=30,
-                HealthCheckTimeoutSeconds=5,  # タイムアウトを短縮
+                HealthCheckTimeoutSeconds=5,
                 HealthyThresholdCount=2,
                 UnhealthyThresholdCount=3,
                 Matcher={'HttpCode': '200'}
@@ -291,13 +380,10 @@ def deploy_app(req: DeployRequest):
             )
             logger.info(f"Created ALB rule with priority {next_priority}")
 
-        # ECSタスク定義の設定
+        # ECSタスク定義の設定 - Terraform outputsから取得
         task_definition_family = app_name
-        execution_role_arn = os.getenv("ECS_TASK_EXECUTION_ROLE_ARN")
-        task_role_arn = os.getenv("ECS_TASK_ROLE_ARN")
-        
-        if not execution_role_arn or not task_role_arn:
-            raise HTTPException(status_code=500, detail="ECS role ARNs not configured")
+        execution_role_arn = get_config_value("ECS_TASK_EXECUTION_ROLE_ARN", "ecs_task_execution_role_arn")
+        task_role_arn = get_config_value("ECS_TASK_ROLE_ARN", "ecs_task_role_arn")
 
         # CloudWatch Logsの確認
         log_group_name = f"/ecs/{app_name}"
@@ -345,9 +431,35 @@ def deploy_app(req: DeployRequest):
             ]
         )
 
-        # サブネット・セキュリティグループ設定
-        subnets = [s.strip() for s in os.getenv("SUBNETS", "").split(",") if s.strip()]
-        security_groups = [s.strip() for s in os.getenv("SECURITY_GROUPS", "").split(",") if s.strip()]
+        # サブネット・セキュリティグループ設定 - Terraform outputsと環境変数から取得
+        # SUBNETSが設定されていればそれを使用、なければpublic_subnet_idsから取得
+        subnets_str = get_config_value("SUBNETS", "private_subnet_ids", None)
+        if not subnets_str:
+            # Terraform outputからpublic_subnet_idsを取得
+            tf_outputs = load_terraform_outputs()
+            public_subnets = tf_outputs.get("public_subnet_ids", [])
+            if isinstance(public_subnets, list):
+                subnets_str = ",".join(public_subnets)
+            else:
+                subnets_str = str(public_subnets)
+        
+        if isinstance(subnets_str, list):
+            subnets = [s.strip() for s in subnets_str if s.strip()]
+        else:
+            subnets = [s.strip() for s in str(subnets_str).split(",") if s.strip()]
+        
+        # セキュリティグループも同様に取得
+        security_groups_str = get_config_value("SECURITY_GROUPS", "ecs_security_group_id", None)
+        if not security_groups_str:
+            # ECSタスク用のセキュリティグループIDを取得
+            ecs_sg_id = get_config_value("ECS_SECURITY_GROUP_ID", "ecs_security_group_id", None)
+            if ecs_sg_id:
+                security_groups_str = ecs_sg_id
+        
+        if isinstance(security_groups_str, list):
+            security_groups = [s.strip() for s in security_groups_str if s.strip()]
+        else:
+            security_groups = [s.strip() for s in str(security_groups_str).split(",") if s.strip()]
 
         # ECSサービスの処理
         services = ecs.describe_services(cluster=CLUSTER_NAME, services=[app_name])["services"]
