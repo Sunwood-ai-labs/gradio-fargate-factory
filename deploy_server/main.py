@@ -1,163 +1,21 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import os
 import subprocess
 import boto3
+from fastapi import FastAPI, HTTPException
 from loguru import logger
-import os
-import json
-from dotenv import load_dotenv
-from botocore.exceptions import ClientError
-from pathlib import Path
 
-load_dotenv()
+from models.deploy import DeployRequest
+from utils.common import (
+    load_terraform_outputs,
+    get_config_value,
+    ensure_security_group_rules,
+    AWS_REGION,
+    CLUSTER_NAME,
+    TERRAFORM_STATE_PATH,
+)
 
 logger.add("deploy_server.log", rotation="1 MB")
 app = FastAPI()
-
-# AWS Region - 環境変数から取得、デフォルトは ap-northeast-1
-AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-1")
-CLUSTER_NAME = os.getenv("ECS_CLUSTER_NAME", "gradio-ecs-cluster")
-
-# Terraform状態ファイルのパス（環境変数で指定可能）
-TERRAFORM_STATE_PATH = os.getenv("TERRAFORM_STATE_PATH", "terraform/base-infrastructure/terraform.tfstate")
-
-class DeployRequest(BaseModel):
-    app_name: str
-    docker_context: str = "./"
-    dockerfile: str = "Dockerfile"
-    alb_path: str  # 例: "/image-filter/*"
-    git_repo_url: str | None = None
-    cpu: str = "2048"
-    memory: str = "4096"
-    force_recreate: bool = False
-
-def load_terraform_outputs():
-    """Terraform状態ファイルからoutputを読み込み"""
-    try:
-        # 絶対パスと相対パスの両方に対応
-        if os.path.isabs(TERRAFORM_STATE_PATH):
-            state_file_path = Path(TERRAFORM_STATE_PATH)
-        else:
-            # 相対パスの場合、プロジェクトルートからの相対パス
-            project_root = Path(__file__).parent.parent  # deploy_server/../
-            state_file_path = project_root / TERRAFORM_STATE_PATH
-        
-        if not state_file_path.exists():
-            logger.warning(f"Terraform state file not found at {state_file_path}")
-            return {}
-        
-        with open(state_file_path, 'r') as f:
-            state_data = json.load(f)
-        
-        outputs = {}
-        if 'outputs' in state_data:
-            for key, output in state_data['outputs'].items():
-                outputs[key] = output['value']
-        
-        logger.info(f"Loaded Terraform outputs from {state_file_path}")
-        logger.debug(f"Available outputs: {list(outputs.keys())}")
-        return outputs
-        
-    except Exception as e:
-        logger.error(f"Error loading Terraform outputs: {e}")
-        return {}
-
-def get_config_value(env_key: str, tf_output_key: str = None, default: str = None):
-    """環境変数 > Terraform output > デフォルト値 の優先順位で設定値を取得"""
-    # 環境変数が設定されていればそれを使用
-    env_value = os.getenv(env_key)
-    if env_value:
-        return env_value
-    
-    # Terraform outputから取得を試行
-    if tf_output_key:
-        tf_outputs = load_terraform_outputs()
-        tf_value = tf_outputs.get(tf_output_key)
-        if tf_value:
-            return tf_value
-    
-    # デフォルト値を返す
-    if default is not None:
-        return default
-    
-    # どこからも取得できない場合は例外
-    raise ValueError(f"Configuration value not found: env_key={env_key}, tf_output_key={tf_output_key}")
-
-def ensure_security_group_rules():
-    """ECSセキュリティグループに必要なルールを追加"""
-    try:
-        ec2 = boto3.client("ec2", region_name=AWS_REGION)
-        
-        # セキュリティグループIDを取得
-        ecs_sg_id = get_config_value("ECS_SECURITY_GROUP_ID", "ecs_security_group_id", None)
-        alb_sg_id = get_config_value("ALB_SECURITY_GROUP_ID", "alb_security_group_id", None)
-        
-        if not ecs_sg_id:
-            logger.warning("ECS Security Group ID not found - checking Terraform outputs for ecs_tasks security group")
-            # Terraform stateから直接ECSタスク用セキュリティグループを探す
-            tf_outputs = load_terraform_outputs()
-            # aws_security_group.ecs_tasksのIDを探す
-            if 'resources' in load_terraform_outputs():
-                # この場合は別の方法でSGを見つける必要がある
-                pass
-        
-        if not ecs_sg_id or not alb_sg_id:
-            logger.warning("Security Group IDs not configured - skipping rule setup")
-            return
-        
-        # ALBからECSへのポート7860通信を許可
-        try:
-            ec2.authorize_security_group_ingress(
-                GroupId=ecs_sg_id,
-                IpPermissions=[
-                    {
-                        'IpProtocol': 'tcp',
-                        'FromPort': 7860,
-                        'ToPort': 7860,
-                        'UserIdGroupPairs': [
-                            {
-                                'GroupId': alb_sg_id,
-                                'Description': 'ALB to ECS Gradio port'
-                            }
-                        ]
-                    }
-                ]
-            )
-            logger.info(f"Added port 7860 rule: ALB ({alb_sg_id}) -> ECS ({ecs_sg_id})")
-        except ClientError as e:
-            if 'InvalidPermission.Duplicate' in str(e):
-                logger.info("Port 7860 ALB->ECS rule already exists")
-            else:
-                logger.error(f"Failed to add ALB->ECS rule: {e}")
-        
-        # ECS自己参照でのポート7860も追加
-        try:
-            ec2.authorize_security_group_ingress(
-                GroupId=ecs_sg_id,
-                IpPermissions=[
-                    {
-                        'IpProtocol': 'tcp',
-                        'FromPort': 7860,
-                        'ToPort': 7860,
-                        'UserIdGroupPairs': [
-                            {
-                                'GroupId': ecs_sg_id,
-                                'Description': 'ECS self-reference for Gradio'
-                            }
-                        ]
-                    }
-                ]
-            )
-            logger.info(f"Added port 7860 self-reference rule for ECS ({ecs_sg_id})")
-        except ClientError as e:
-            if 'InvalidPermission.Duplicate' in str(e):
-                logger.info("Port 7860 self-reference rule already exists")
-            else:
-                logger.error(f"Failed to add self-reference rule: {e}")
-                
-    except Exception as e:
-        logger.error(f"Error setting up security group rules: {e}")
-        # セキュリティグループの設定は失敗してもデプロイを続行
 
 @app.get("/config")
 def get_current_config():
@@ -394,41 +252,9 @@ def deploy_app(req: DeployRequest):
             logger.info(f"Log group already exists: {log_group_name}")
 
         # 新しいタスク定義を登録
-        logger.info(f"Registering task definition with CPU: {req.cpu}, Memory: {req.memory}")
-        ecs.register_task_definition(
-            family=task_definition_family,
-            networkMode="awsvpc",
-            requiresCompatibilities=["FARGATE"],
-            cpu=req.cpu,
-            memory=req.memory,
-            executionRoleArn=execution_role_arn,
-            taskRoleArn=task_role_arn,
-            containerDefinitions=[
-                {
-                    "name": app_name,
-                    "image": f"{ecr_url}:latest",
-                    "portMappings": [
-                        {
-                            "containerPort": 7860,
-                            "protocol": "tcp"
-                        }
-                    ],
-                    "essential": True,
-                    "environment": [
-                        {"name": "GRADIO_SERVER_NAME", "value": "0.0.0.0"},
-                        {"name": "GRADIO_SERVER_PORT", "value": "7860"},
-                        {"name": "GRADIO_ROOT_PATH", "value": gradio_root_path}
-                    ],
-                    "logConfiguration": {
-                        "logDriver": "awslogs",
-                        "options": {
-                            "awslogs-group": log_group_name,
-                            "awslogs-region": AWS_REGION,
-                            "awslogs-stream-prefix": "ecs"
-                        }
-                    }
-                }
-            ]
+        from utils.aws import register_task_definition, update_ecs_service, delete_ecs_service, create_ecs_service
+        register_task_definition(
+            ecs, app_name, req, ecr_url, gradio_root_path, log_group_name, execution_role_arn, task_role_arn
         )
 
         # サブネット・セキュリティグループ設定 - Terraform outputsと環境変数から取得
@@ -467,30 +293,13 @@ def deploy_app(req: DeployRequest):
         if services and services[0]["status"] == "ACTIVE" and not req.force_recreate:
             # 既存サービスを更新
             logger.info(f"Updating existing ECS service: {app_name}")
-            try:
-                ecs.update_service(
-                    cluster=CLUSTER_NAME,
-                    service=app_name,
-                    taskDefinition=task_definition_family,
-                    enableExecuteCommand=True, 
-                    forceNewDeployment=True
-                )
-                logger.info(f"Successfully updated service: {app_name}")
-                deployment_type = "update"
-                
-            except Exception as update_e:
-                logger.error(f"Failed to update service: {update_e}")
-                raise HTTPException(status_code=500, detail=f"Service update failed: {update_e}")
+            deployment_type = update_ecs_service(ecs, app_name, task_definition_family)
                 
         else:
             # 新しいサービスを作成
             if services and req.force_recreate:
-                logger.info(f"Force recreate requested - deleting existing service")
-                try:
-                    ecs.delete_service(cluster=CLUSTER_NAME, service=app_name, force=True)
-                    logger.info(f"Deleted existing service for recreation")
-                    
-                    # 削除完了を待機
+                deleted = delete_ecs_service(ecs, app_name)
+                if deleted:
                     import time
                     for i in range(30):
                         time.sleep(10)
@@ -501,38 +310,10 @@ def deploy_app(req: DeployRequest):
                                 break
                         except:
                             break
-                except Exception as del_e:
-                    logger.warning(f"Failed to delete service: {del_e}")
             
-            logger.info(f"Creating new ECS service: {app_name}")
-            try:
-                ecs.create_service(
-                    cluster=CLUSTER_NAME,
-                    serviceName=app_name,
-                    taskDefinition=task_definition_family,
-                    enableExecuteCommand=True,
-                    loadBalancers=[{
-                        "targetGroupArn": tg_arn,
-                        "containerName": app_name,
-                        "containerPort": 7860
-                    }],
-                    desiredCount=1,
-                    launchType="FARGATE",
-                    networkConfiguration={
-                        "awsvpcConfiguration": {
-                            "subnets": subnets,
-                            "securityGroups": security_groups,
-                            "assignPublicIp": "ENABLED"
-                        }
-                    },
-                    healthCheckGracePeriodSeconds=300
-                )
-                logger.info(f"Successfully created service: {app_name}")
-                deployment_type = "create"
-                
-            except Exception as create_e:
-                logger.error(f"Failed to create service: {create_e}")
-                raise HTTPException(status_code=500, detail=f"Service creation failed: {create_e}")
+            deployment_type = create_ecs_service(
+                ecs, app_name, task_definition_family, tg_arn, subnets, security_groups
+            )
 
         # 成功ログとレスポンス
         logger.info(f"🚀 Deployment completed: {deployed_url}")
