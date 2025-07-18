@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="header2.png" alt="Gradio Fargate Factory" width="600"/>
+  <img src="header2.png" alt="Gradio Fargate Factory" width="100%"/>
 </p>
 
 <h1 align="center">Gradio Fargate Factory</h1>
@@ -453,3 +453,93 @@ terraform destroy
 ---
 
 これで動的にGradioアプリを追加・管理できるシステムの完成です！🎉
+
+## Terraform ベストプラクティス構成案
+
+本リポジトリのTerraformコードは、以下のベストプラクティス構成にリファクタリングします。
+
+### ディレクトリ構成例
+
+```
+terraform/
+  ├── modules/
+  │     ├── vpc/
+  │     ├── alb/
+  │     ├── ecs/
+  │     └── iam/
+  ├── environments/
+  │     ├── dev/
+  │     │    └── terraform.tfvars
+  │     └── prod/
+  │          └── terraform.tfvars
+  ├── main.tf
+  ├── variables.tf
+  ├── outputs.tf
+  ├── provider.tf
+  ├── backend.tf
+  └── terraform.tfvars.example
+```
+
+- `modules/`：各リソースをモジュール化し再利用性・保守性を向上
+- `environments/`：環境ごとに変数値を管理
+- ルートに `main.tf` などを分割配置
+- `terraform.tfvars.example` もルートに配置
+
+### ファイル分割例
+
+- `provider.tf`：provider定義
+- `backend.tf`：backend定義
+- `main.tf`：module呼び出し
+- `variables.tf`：全体変数
+- `outputs.tf`：全体outputs
+
+この構成に従い、今後のTerraformコードを整理・運用します。
+
+### 実際のディレクトリ構成例
+
+```
+terraform/
+  ├── backend.tf
+  ├── main.tf
+  ├── outputs.tf
+  ├── provider.tf
+  ├── variables.tf
+  ├── terraform.tfvars.example
+  ├── environments/
+  │     └── dev/
+  │         └── terraform.tfvars
+  └── modules/
+        ├── vpc/
+        │     ├── main.tf
+        │     └── variables.tf
+        ├── alb/
+        │     ├── main.tf
+        │     └── variables.tf
+        ├── ecs/
+        │     ├── main.tf
+        │     └── variables.tf
+        └── iam/
+              ├── main.tf
+              └── variables.tf
+```
+
+### 運用・利用方法
+
+1. 初期化  
+   ```
+   cd terraform
+   terraform init
+   ```
+
+2. plan（例: dev環境）  
+   ```
+   terraform plan -var-file=./environments/dev/terraform.tfvars
+   ```
+
+3. apply（例: dev環境）  
+   ```
+   terraform apply -var-file=./environments/dev/terraform.tfvars
+   ```
+
+- `terraform.tfvars.example` を参考に、各環境の `terraform.tfvars` を作成してください。
+- moduleのinput/outputは `main.tf` で適切に記述してください。
