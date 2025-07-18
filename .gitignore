@@ -49,5 +49,4 @@ check2.sh
 
 .env
 
-
-.env
+terraform/environments/base-infrastructure/.terraform.lock.hcl
