@@ -1,0 +1,25 @@
+name: Deploy Application
+on:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Deploy Application
+      run: |
+        # リポジトリ名からアプリ名を取得
+        APP_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2)
+        
+        # 直接APIを叩く
+        curl -X POST http://192.168.0.131:8002/deploy \
+          -H "Content-Type: application/json" \
+          -d '{
+            "app_name": "'${APP_NAME}'",
+            "alb_path": "/'${APP_NAME}'/*",
+            "git_repo_url": "${{ github.server_url }}/${{ github.repository }}.git",
+            "cpu": "512",
+            "memory": "1024",
+            "force_recreate": false
+          }'
