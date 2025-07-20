@@ -50,3 +50,4 @@ check2.sh
 .env
 
 terraform/environments/base-infrastructure/.terraform.lock.hcl
+deploy_server/.env.backup.*

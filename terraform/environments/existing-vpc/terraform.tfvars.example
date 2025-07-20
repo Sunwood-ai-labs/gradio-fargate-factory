@@ -1,0 +1,24 @@
+project_name  = "gradio-ecs2"
+environment   = "existing-vpc"
+aws_region    = "ap-northeast-1"
+
+# ====================================
+# 既存のVPCとサブネット設定
+# ====================================
+# 注意: 以下のIDを実際の環境のものに置き換えてください
+
+# 既存VPCのID
+vpc_id = "vpc-06fbd468cd6ab43b1"
+
+# ALB用のパブリックサブネット（インターネットゲートウェイ経由でインターネット接続可能）
+public_subnet_ids = [
+  "subnet-0281e3ebbce6298b5",  # ap-northeast-1a
+  "subnet-0d0fbe1f902bec458"   # ap-northeast-1c
+]
+
+# ECSタスク用のプライベートサブネット（NATゲートウェイ経由でインターネット接続）
+# これらのサブネットは適切なルートテーブルでNATゲートウェイへのルートが設定されている必要があります
+private_subnet_ids = [
+  "subnet-0d9bcee32a3c396b8",  # ap-northeast-1a
+  "subnet-03254ddf51e77ab01"   # ap-northeast-1c
+]
