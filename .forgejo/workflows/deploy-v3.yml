@@ -1,0 +1,77 @@
+name: Deploy Application v3
+on:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Deploy Application and Update Website URL
+      run: |
+        # リポジトリ名からアプリ名を取得
+        APP_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2)
+        
+        # デプロイAPIを叩く
+        echo "🚀 Deploying ${APP_NAME}..."
+        RESPONSE=$(curl -s -X POST http://192.168.0.131:8002/deploy \
+          -H "Content-Type: application/json" \
+          -d '{
+            "app_name": "'${APP_NAME}'",
+            "alb_path": "/'${APP_NAME}'/*",
+            "git_repo_url": "${{ github.server_url }}/${{ github.repository }}.git",
+            "cpu": "512",
+            "memory": "1024",
+            "force_recreate": false
+          }')
+        
+        echo "Response: $RESPONSE"
+        
+        # レスポンスからstatusとdeployed_urlを抽出
+        STATUS=$(echo "$RESPONSE" | jq -r '.status // "error"')
+        DEPLOYED_URL=$(echo "$RESPONSE" | jq -r '.deployed_url // ""')
+        MESSAGE=$(echo "$RESPONSE" | jq -r '.message // "No message"')
+        
+        # URLの末尾にスラッシュを追加（まだない場合）
+        if [ -n "$DEPLOYED_URL" ] && [[ ! "$DEPLOYED_URL" =~ /$ ]]; then
+          DEPLOYED_URL="${DEPLOYED_URL}/"
+        fi
+        
+        echo "Status: $STATUS"
+        echo "Deployed URL: $DEPLOYED_URL"
+        echo "Message: $MESSAGE"
+        
+        if [ "$STATUS" = "success" ] && [ -n "$DEPLOYED_URL" ]; then
+          echo "✅ SUCCESS"
+          echo "URL: $DEPLOYED_URL"
+          
+          # Forgejo APIでリポジトリのWebサイトURLを更新
+          echo "🔗 Updating repository website URL..."
+          
+          UPDATE_RESPONSE=$(curl -s -X PATCH "${{ github.server_url }}/api/v1/repos/${{ github.repository }}" \
+            -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"website": "'$DEPLOYED_URL'"}')
+          
+          echo "Update API Response: $UPDATE_RESPONSE"
+          echo "✅ Repository website URL updated to: $DEPLOYED_URL"
+          
+        else
+          echo "❌ DEPLOYMENT FAILED"
+          echo "Status: $STATUS"
+          echo "Message: $MESSAGE"
+          exit 1
+        fi
+
+    - name: Notify Success
+      if: success()
+      run: |
+        echo "🎉 Deployment and URL update completed successfully!"
+
+    - name: Notify Failure  
+      if: failure()
+      run: |
+        echo "💥 Deployment or URL update failed!"
