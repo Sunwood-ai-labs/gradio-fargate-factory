@@ -74,6 +74,20 @@ def delete_ecs_service(ecs, app_name):
 
 def create_ecs_service(ecs, app_name, task_definition_family, tg_arn, subnets, security_groups):
     logger.info(f"Creating new ECS service: {app_name}")
+    
+    # プライベートサブネットを使用しているかチェック
+    tf_outputs = load_terraform_outputs()
+    private_subnet_ids = tf_outputs.get("private_subnet_ids", [])
+    
+    # サブネットがプライベートサブネットの場合は assignPublicIp を DISABLED に
+    is_using_private_subnets = any(subnet in private_subnet_ids for subnet in subnets)
+    assign_public_ip = "DISABLED" if is_using_private_subnets else "ENABLED"
+    
+    logger.info(f"Using subnets: {subnets}")
+    logger.info(f"Private subnets available: {private_subnet_ids}")
+    logger.info(f"Using private subnets: {is_using_private_subnets}")
+    logger.info(f"Assign public IP: {assign_public_ip}")
+    
     try:
         ecs.create_service(
             cluster=CLUSTER_NAME,
@@ -91,7 +105,7 @@ def create_ecs_service(ecs, app_name, task_definition_family, tg_arn, subnets, s
                 "awsvpcConfiguration": {
                     "subnets": subnets,
                     "securityGroups": security_groups,
-                    "assignPublicIp": "ENABLED"
+                    "assignPublicIp": assign_public_ip
                 }
             },
             healthCheckGracePeriodSeconds=300
