@@ -163,29 +163,45 @@ def deploy_app(req: DeployRequest):
         logger.info(f"Gradio Root Path: {gradio_root_path}")
         logger.info(f"Health Check Path: {health_check_path}")
 
-        # ターゲットグループの確認・作成・更新
+        # ターゲットグループの確認・作成・更新（VPC整合性チェック付き）
         tg_name = f"{app_name}-tg"
         tg_arn = None
-        
+
         try:
             existing_tgs = elbv2.describe_target_groups(Names=[tg_name])["TargetGroups"]
-            tg_arn = existing_tgs[0]["TargetGroupArn"]
-            logger.info(f"Using existing target group: {tg_name}")
+            existing_tg = existing_tgs[0]
+            existing_vpc_id = existing_tg["VpcId"]
             
-            # ヘルスチェック設定を最適化
-            elbv2.modify_target_group(
-                TargetGroupArn=tg_arn,
-                HealthCheckPath=health_check_path,
-                HealthCheckIntervalSeconds=30,
-                HealthCheckTimeoutSeconds=5,
-                HealthyThresholdCount=2,
-                UnhealthyThresholdCount=3,
-                Matcher={'HttpCode': '200'}
-            )
-            logger.info(f"Updated health check settings for target group '{tg_name}'")
+            # VPC IDの整合性をチェック
+            if existing_vpc_id != alb_vpc_id:
+                logger.warning(f"Target group '{tg_name}' exists in different VPC ({existing_vpc_id}) than ALB ({alb_vpc_id}). Deleting and recreating...")
+                
+                # 既存のターゲットグループを削除
+                elbv2.delete_target_group(TargetGroupArn=existing_tg["TargetGroupArn"])
+                logger.info(f"Deleted target group '{tg_name}' from incorrect VPC")
+                
+                # 新しいターゲットグループを作成（下記の作成処理に進む）
+                raise elbv2.exceptions.TargetGroupNotFoundException()
+            
+            else:
+                # VPCが一致している場合は既存のものを使用
+                tg_arn = existing_tg["TargetGroupArn"]
+                logger.info(f"Using existing target group: {tg_name} (VPC: {existing_vpc_id})")
+                
+                # ヘルスチェック設定を最適化
+                elbv2.modify_target_group(
+                    TargetGroupArn=tg_arn,
+                    HealthCheckPath=health_check_path,
+                    HealthCheckIntervalSeconds=30,
+                    HealthCheckTimeoutSeconds=5,
+                    HealthyThresholdCount=2,
+                    UnhealthyThresholdCount=3,
+                    Matcher={'HttpCode': '200'}
+                )
+                logger.info(f"Updated health check settings for target group '{tg_name}'")
 
         except elbv2.exceptions.TargetGroupNotFoundException:
-            logger.info(f"Creating new target group: {tg_name}")
+            logger.info(f"Creating new target group: {tg_name} in VPC: {alb_vpc_id}")
             tg = elbv2.create_target_group(
                 Name=tg_name,
                 Protocol="HTTP",
@@ -201,7 +217,8 @@ def deploy_app(req: DeployRequest):
                 Matcher={'HttpCode': '200'}
             )
             tg_arn = tg["TargetGroups"][0]["TargetGroupArn"]
-            logger.info(f"Created target group: {tg_name}")
+            logger.info(f"Created target group: {tg_name} in VPC: {alb_vpc_id}")
+            
 
         # ALBルールの確認・作成
         rules = elbv2.describe_rules(ListenerArn=alb_listener_arn)["Rules"]
@@ -258,16 +275,16 @@ def deploy_app(req: DeployRequest):
         )
 
         # サブネット・セキュリティグループ設定 - Terraform outputsと環境変数から取得
-        # SUBNETSが設定されていればそれを使用、なければpublic_subnet_idsから取得
+        # SUBNETSが設定されていればそれを使用、なければprivate_subnet_idsから取得
         subnets_str = get_config_value("SUBNETS", "private_subnet_ids", None)
         if not subnets_str:
-            # Terraform outputからpublic_subnet_idsを取得
+            # Terraform outputからprivate_subnet_idsを取得
             tf_outputs = load_terraform_outputs()
-            public_subnets = tf_outputs.get("public_subnet_ids", [])
-            if isinstance(public_subnets, list):
-                subnets_str = ",".join(public_subnets)
+            private_subnets = tf_outputs.get("private_subnet_ids", [])
+            if isinstance(private_subnets, list):
+                subnets_str = ",".join(private_subnets)
             else:
-                subnets_str = str(public_subnets)
+                subnets_str = str(private_subnets)
         
         if isinstance(subnets_str, list):
             subnets = [s.strip() for s in subnets_str if s.strip()]
